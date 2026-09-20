@@ -1,12 +1,21 @@
-# TrendFlow AI v6.1 Deployment
+# TrendFlow AI v6.1 deployment
 
-1. Copy the v6.1 release files into this repository.
-2. Configure production secrets outside Git.
-3. Point DNS for your application domain to the VPS.
-4. Run the supplied production deployment script.
-5. Verify /health/live and /health/ready.
-6. Open the HTTPS application URL.
+## Local
+Run the stack with Docker Desktop:
+docker compose up --build
+Then open http://localhost:8080.
 
-The application uses Caddy for HTTPS and same-origin routing, FastAPI for the API, PostgreSQL for persistence, Redis for jobs, MinIO/S3 for assets, workers for background processing, and a scheduler for autonomous cycles.
+Never open frontend/index.html directly. Caddy serves the UI and proxies /api, /health and /metrics to FastAPI.
 
-Never commit .env or provider credentials.
+## Production
+1. Copy the repository to an Ubuntu VPS.
+2. Create .env from .env.production.example using strong random secrets.
+3. Point the domain A/AAAA record to the VPS.
+4. Run ops/deploy.sh your.domain.com.
+5. Verify https://your.domain.com/health/live and /health/ready.
+6. Add provider credentials only through the server environment or a secret manager.
+
+Do not commit .env, OAuth client secrets, API keys, JWT secrets, database passwords, or token-vault keys.
+
+## GitHub
+The repository is private and CI validates Python syntax and Compose configuration on pushes and pull requests.
