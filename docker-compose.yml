@@ -1,0 +1,93 @@
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: trendflow
+      POSTGRES_PASSWORD: trendflow
+      POSTGRES_DB: trendflow
+    volumes: [pgdata:/var/lib/postgresql/data]
+  redis:
+    image: redis:7
+  minio:
+    image: minio/minio
+    command: server /data --console-address :9001
+    environment:
+      MINIO_ROOT_USER: trendflow
+      MINIO_ROOT_PASSWORD: change-me-now
+    volumes: [miniodata:/data]
+  api:
+    build: ./backend
+    environment:
+      DATABASE_URL: postgresql+psycopg://trendflow:trendflow@postgres:5432/trendflow
+      REDIS_URL: redis://redis:6379/0
+      API_URL: http://api:8000
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_TEXT_MODEL: ${OPENAI_TEXT_MODEL:-gpt-5.6-luna}
+      OPENAI_IMAGE_MODEL: ${OPENAI_IMAGE_MODEL:-gpt-image-2}
+      OPENAI_TTS_MODEL: ${OPENAI_TTS_MODEL:-gpt-4o-mini-tts}
+      OPENAI_TRANSCRIBE_MODEL: ${OPENAI_TRANSCRIBE_MODEL:-gpt-transcribe}
+      TOKEN_VAULT_KEY: ${TOKEN_VAULT_KEY:-}
+      S3_ENDPOINT: http://minio:9000
+      S3_BUCKET: trendflow-assets
+      S3_ACCESS_KEY: trendflow
+      S3_SECRET_KEY: change-me-now
+      S3_PUBLIC_BASE_URL: ${S3_PUBLIC_BASE_URL:-}
+      META_GRAPH_URL: ${META_GRAPH_URL:-https://graph.facebook.com/v24.0}
+      THREADS_API_URL: ${THREADS_API_URL:-https://graph.threads.net}
+      META_APP_ID: ${META_APP_ID:-}
+      META_APP_SECRET: ${META_APP_SECRET:-}
+      GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID:-}
+      GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET:-}
+      TIKTOK_CLIENT_KEY: ${TIKTOK_CLIENT_KEY:-}
+      TIKTOK_CLIENT_SECRET: ${TIKTOK_CLIENT_SECRET:-}
+      LINKEDIN_CLIENT_ID: ${LINKEDIN_CLIENT_ID:-}
+      LINKEDIN_CLIENT_SECRET: ${LINKEDIN_CLIENT_SECRET:-}
+      X_CLIENT_ID: ${X_CLIENT_ID:-}
+      X_CLIENT_SECRET: ${X_CLIENT_SECRET:-}
+      X_CODE_VERIFIER: ${X_CODE_VERIFIER:-}
+      PINTEREST_APP_ID: ${PINTEREST_APP_ID:-}
+      PINTEREST_APP_SECRET: ${PINTEREST_APP_SECRET:-}
+      LINKEDIN_VERSION: ${LINKEDIN_VERSION:-202606}
+    expose: ['8000']
+    healthcheck:
+      test: ['CMD', 'python', '-c', "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health/ready')"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+    depends_on: [postgres, redis, minio]
+  worker:
+    build: ./worker
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      API_URL: http://api:8000
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_TEXT_MODEL: ${OPENAI_TEXT_MODEL:-gpt-5.6-luna}
+      OPENAI_IMAGE_MODEL: ${OPENAI_IMAGE_MODEL:-gpt-image-2}
+      OPENAI_TTS_MODEL: ${OPENAI_TTS_MODEL:-gpt-4o-mini-tts}
+      S3_ENDPOINT: http://minio:9000
+      S3_BUCKET: trendflow-assets
+      S3_ACCESS_KEY: trendflow
+      S3_SECRET_KEY: change-me-now
+    depends_on: [redis, api, minio]
+  scheduler:
+    build: ./worker
+    command: python scheduler.py
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      API_URL: http://api:8000
+      AUTONOMY_INTERVAL_SECONDS: ${AUTONOMY_INTERVAL_SECONDS:-3600}
+    depends_on: [api, redis]
+  web:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    ports: ['8080:80']
+    volumes:
+      - ./Caddyfile.local:/etc/caddy/Caddyfile:ro
+      - ./frontend:/srv/frontend:ro
+    depends_on:
+      api: {condition: service_healthy}
+    networks: [default]
+
+volumes:
+  pgdata: {}
+  miniodata: {}
