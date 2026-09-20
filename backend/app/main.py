@@ -323,3 +323,82 @@ def publish(cid):
  db=SessionLocal(); c=db.get(Content,cid)
  if not c or c.status!='AUTHORIZED': raise HTTPException(403,'Publishing requires human approval and explicit authorization')
  c.status='PUBLISHING'; db.commit(); enqueue({'type':'publish','content_id':cid}); audit(db,'publish_queued',cid); return {'status':c.status}
+@app.post('/api/publish')
+def publish_one(x:PublishRequest):
+ db=SessionLocal(); c=db.get(Content,x.content_id)
+ if not c or c.status!='AUTHORIZED': raise HTTPException(403,'Publishing requires authorization')
+ a=db.query(SocialAccount).filter_by(influencer_id=c.influencer_id,platform=x.platform,connected=True).first()
+ if not a: raise HTTPException(404,'Connected account not found')
+ asset_id=x.asset_id or c.payload.get('asset_id'); asset=db.get(Asset,asset_id) if asset_id else None
+ try:
+  token=vault.decrypt(a.token_ciphertext); result=publisher_for(a,token).publish(c.payload,{'kind':asset.kind,'uri':asset.uri,'public_url':asset.public_url,'platform_urn':(asset.metadata_json or {}).get('platform_urn'),'bytes':storage.get(asset.uri)} if asset else None)
+ except PublishError as e: raise HTTPException(502,str(e))
+ except Exception as e: raise HTTPException(502,str(e))
+ c.payload={**c.payload,'published':{**(c.payload.get('published') or {}),x.platform:result}}; db.commit(); audit(db,'published',c.id,{'platform':x.platform,'result':result}); return result
+@app.post('/api/analytics/collect')
+def collect_analytics(x:AnalyticsRequest):
+ db=SessionLocal(); c=db.get(Content,x.content_id)
+ if not c: raise HTTPException(404,'Content not found')
+ results={}
+ for platform,info in (c.payload.get('published') or {}).items():
+  a=db.query(SocialAccount).filter_by(influencer_id=c.influencer_id,platform=platform,connected=True).first()
+  if not a: continue
+  pid=info.get('platform_id') or info.get('id')
+  if not pid: continue
+  try:
+   token=vault.decrypt(a.token_ciphertext); metrics=collect(platform,token,a.metadata_json,pid); db.add(Analytics(id=str(uuid.uuid4()),content_id=c.id,platform=platform,metrics=metrics)); results[platform]=metrics
+  except Exception as e: results[platform]={'error':str(e)}
+ db.commit(); audit(db,'analytics_collected',c.id,{'platforms':list(results)}); return results
+@app.get('/api/analytics/{cid}')
+def get_analytics(cid):
+ db=SessionLocal(); return [{'platform':a.platform,'metrics':a.metrics,'captured_at':a.captured_at} for a in db.query(Analytics).filter_by(content_id=cid).order_by(Analytics.captured_at.desc()).all()]
+@app.get('/api/learning/{iid}')
+def learning(iid):
+ db=SessionLocal(); rows=db.query(Analytics).join(Content,Analytics.content_id==Content.id).filter(Content.influencer_id==iid).all(); totals={}
+ for r in rows:
+  for k,v in (r.metrics or {}).items():
+   if isinstance(v,(int,float)): totals[k]=totals.get(k,0)+v
+ return {'influencer_id':iid,'samples':len(rows),'aggregate_metrics':totals,'next_action':'Use these metrics to update content pillars, hooks, posting times and format mix.'}
+@app.post('/api/assets/upload')
+async def upload_asset(influencer_id:str,kind:str,file:UploadFile=File(...)):
+ data=await file.read(); uri=storage.put(data,file.content_type or 'application/octet-stream',f'{influencer_id}/{kind}'); public=publicize(uri)
+ db=SessionLocal(); aid=str(uuid.uuid4()); db.add(Asset(id=aid,influencer_id=influencer_id,kind=kind,uri=uri,public_url=public,metadata_json={'filename':file.filename,'content_type':file.content_type})); db.commit(); audit(db,'asset_uploaded',aid); return {'id':aid,'uri':uri,'public_url':public}
+@app.post('/api/assets/generate-image')
+def generate_image(influencer_id:str,prompt:str,size:str='1024x1024'):
+ try:data=ai.image(prompt,size)
+ except AIError as e: raise HTTPException(503,str(e))
+ uri=storage.put(data,'image/png',f'{influencer_id}/images'); public=publicize(uri); db=SessionLocal(); aid=str(uuid.uuid4()); db.add(Asset(id=aid,influencer_id=influencer_id,kind='image',uri=uri,public_url=public,metadata_json={'size':size,'prompt':prompt,'provider':'openai'})); db.commit(); audit(db,'image_generated',aid); return {'id':aid,'uri':uri,'public_url':public}
+@app.post('/api/assets/generate-voice')
+def generate_voice(influencer_id:str,text:str,voice:str='alloy'):
+ try:data=ai.speech(text,voice)
+ except AIError as e: raise HTTPException(503,str(e))
+ uri=storage.put(data,'audio/mpeg',f'{influencer_id}/audio'); public=publicize(uri); db=SessionLocal(); aid=str(uuid.uuid4()); db.add(Asset(id=aid,influencer_id=influencer_id,kind='voice',uri=uri,public_url=public,metadata_json={'voice':voice,'provider':'openai'})); db.commit(); audit(db,'voice_generated',aid); return {'id':aid,'uri':uri,'public_url':public}
+@app.post('/api/transcribe')
+async def transcribe(file:UploadFile=File(...)):
+ try:return {'text':ai.transcribe(await file.read(),file.filename or 'audio.mp3')}
+ except AIError as e: raise HTTPException(503,str(e))
+@app.post('/api/autonomy/run')
+def autonomy_run(iid): enqueue({'type':'autonomy_cycle','influencer_id':iid,'policy':{'approval_required':True,'authorization_required':True,'auto_publish':False}}); return {'queued':True,'influencer_id':iid}
+@app.post('/api/autonomy/dispatch')
+def autonomy_dispatch():
+ db=SessionLocal(); ids=[i.id for i in db.query(Influencer).filter_by(status='active').all()]
+ for iid in ids: enqueue({'type':'autonomy_cycle','influencer_id':iid,'policy':{'approval_required':True,'authorization_required':True,'auto_publish':False}})
+ return {'queued':len(ids),'influencers':ids}
+@app.post('/api/autonomy/execute/{iid}')
+def autonomy_execute(iid):
+ db=SessionLocal(); inf=db.get(Influencer,iid)
+ if not inf: raise HTTPException(404,'Influencer not found')
+ if not ai.client:return {'status':'blocked','reason':'OPENAI_API_KEY required'}
+ plan=ai.json(f'Choose the next content opportunity for this influencer using its DNA and previous strategy. DNA: {json.dumps(inf.dna)}. Return topic,format,goal,rationale.')
+ p=make_package(db,inf,GenerateRequest(influencer_id=iid,topic=plan.get('topic',''),format=plan.get('format','reel'),goal=plan.get('goal','engagement')))
+ cid=str(uuid.uuid4()); db.add(Content(id=cid,influencer_id=iid,title=p.get('title','Autonomous Content'),status='DRAFT',payload={**p,'opportunity':plan})); db.commit(); audit(db,'autonomous_content_created',cid,plan); enqueue({'type':'production','content_id':cid}); return {'status':'created','content_id':cid,'opportunity':plan}
+@app.get('/api/autonomy/status/{iid}')
+def autonomy_status(iid):
+ db=SessionLocal(); cs=db.query(Content).filter_by(influencer_id=iid).all(); return {'influencer_id':iid,'counts':{s:sum(c.status==s for c in cs) for s in ['DRAFT','PRODUCED','QA_PASSED','WAITING_APPROVAL','APPROVED','AUTHORIZED','PUBLISHING','PUBLISHED']},'approval_required':True,'authorization_required':True,'auto_publish':False}
+@app.get('/api/providers')
+def providers(): return {'providers':[{'name':'OpenAI','capabilities':['text','image','voice','transcription']},{'name':'Runway','status':'adapter boundary'},{'name':'Kling','status':'adapter boundary'},{'name':'Adobe','status':'adapter boundary'},{'name':'ElevenLabs','status':'adapter boundary'}],'router_policy':['quality','cost','speed','availability','preference']}
+@app.get('/api/agents')
+def agents(): return ['Influencer Architect','Identity Agent','Personality Agent','Trend Scout','Trend Analyst','Content Strategist','Creative Director','Scriptwriter','Image Director','Video Director','Audio Director','QA Agent','Community Manager','Brand Manager','Publishing Agent','Analytics Agent','Learning Agent','Model Router']
+@app.get('/api/audit')
+def audits():
+ db=SessionLocal(); return [{'event':a.event,'entity_id':a.entity_id,'details':a.details,'created_at':a.created_at} for a in db.query(Audit).order_by(Audit.created_at.desc()).limit(300).all()]
