@@ -1,0 +1,132 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:?set}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set}
+      POSTGRES_DB: ${POSTGRES_DB:-trendflow}
+    volumes: [pgdata:/var/lib/postgresql/data]
+    healthcheck:
+      test: ["CMD-SHELL","pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    networks: [internal]
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server","--appendonly","yes","--requirepass","${REDIS_PASSWORD:?set}"]
+    volumes: [redisdata:/data]
+    healthcheck:
+      test: ["CMD-SHELL","redis-cli -a $$REDIS_PASSWORD ping | grep PONG"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    networks: [internal]
+  minio:
+    image: minio/minio:latest
+    restart: unless-stopped
+    command: server /data --console-address :9001
+    environment:
+      MINIO_ROOT_USER: ${S3_ACCESS_KEY:?set}
+      MINIO_ROOT_PASSWORD: ${S3_SECRET_KEY:?set}
+    volumes: [miniodata:/data]
+    networks: [internal]
+  api:
+    build: ./backend
+    restart: unless-stopped
+    environment:
+      APP_ENV: production
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-trendflow}
+      REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379/0
+      JWT_SECRET: ${JWT_SECRET:?set}
+      CORS_ORIGINS: ${CORS_ORIGINS:?set}
+      INTERNAL_SERVICE_TOKEN: ${INTERNAL_SERVICE_TOKEN:?set}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_TEXT_MODEL: ${OPENAI_TEXT_MODEL:-gpt-5.6-luna}
+      OPENAI_IMAGE_MODEL: ${OPENAI_IMAGE_MODEL:-gpt-image-2}
+      OPENAI_TTS_MODEL: ${OPENAI_TTS_MODEL:-gpt-4o-mini-tts}
+      OPENAI_TRANSCRIBE_MODEL: ${OPENAI_TRANSCRIBE_MODEL:-gpt-transcribe}
+      TOKEN_VAULT_KEY: ${TOKEN_VAULT_KEY:?set}
+      S3_ENDPOINT: http://minio:9000
+      S3_BUCKET: ${S3_BUCKET:-trendflow-assets}
+      S3_ACCESS_KEY: ${S3_ACCESS_KEY:?set}
+      S3_SECRET_KEY: ${S3_SECRET_KEY:?set}
+      S3_PUBLIC_BASE_URL: ${S3_PUBLIC_BASE_URL:?set}
+      META_APP_ID: ${META_APP_ID:-}
+      META_APP_SECRET: ${META_APP_SECRET:-}
+      GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID:-}
+      GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET:-}
+      TIKTOK_CLIENT_KEY: ${TIKTOK_CLIENT_KEY:-}
+      TIKTOK_CLIENT_SECRET: ${TIKTOK_CLIENT_SECRET:-}
+      LINKEDIN_CLIENT_ID: ${LINKEDIN_CLIENT_ID:-}
+      LINKEDIN_CLIENT_SECRET: ${LINKEDIN_CLIENT_SECRET:-}
+      X_CLIENT_ID: ${X_CLIENT_ID:-}
+      X_CLIENT_SECRET: ${X_CLIENT_SECRET:-}
+      PINTEREST_APP_ID: ${PINTEREST_APP_ID:-}
+      PINTEREST_APP_SECRET: ${PINTEREST_APP_SECRET:-}
+    expose: ["8000"]
+    depends_on:
+      postgres: {condition: service_healthy}
+      redis: {condition: service_healthy}
+      minio: {condition: service_started}
+    healthcheck:
+      test: ["CMD","python","-c","import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health/ready')"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+    networks: [internal]
+  worker:
+    build: ./worker
+    restart: unless-stopped
+    environment:
+      REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379/0
+      API_URL: http://api:8000
+      INTERNAL_SERVICE_TOKEN: ${INTERNAL_SERVICE_TOKEN:?set}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_TEXT_MODEL: ${OPENAI_TEXT_MODEL:-gpt-5.6-luna}
+      OPENAI_IMAGE_MODEL: ${OPENAI_IMAGE_MODEL:-gpt-image-2}
+      OPENAI_TTS_MODEL: ${OPENAI_TTS_MODEL:-gpt-4o-mini-tts}
+      S3_ENDPOINT: http://minio:9000
+      S3_BUCKET: ${S3_BUCKET:-trendflow-assets}
+      S3_ACCESS_KEY: ${S3_ACCESS_KEY:?set}
+      S3_SECRET_KEY: ${S3_SECRET_KEY:?set}
+    depends_on:
+      api: {condition: service_healthy}
+      redis: {condition: service_healthy}
+      minio: {condition: service_started}
+    networks: [internal]
+  scheduler:
+    build: ./worker
+    restart: unless-stopped
+    command: python scheduler.py
+    environment:
+      REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379/0
+      API_URL: http://api:8000
+      INTERNAL_SERVICE_TOKEN: ${INTERNAL_SERVICE_TOKEN:?set}
+      AUTONOMY_INTERVAL_SECONDS: ${AUTONOMY_INTERVAL_SECONDS:-3600}
+    depends_on: {api: {condition: service_healthy}, redis: {condition: service_healthy}}
+    networks: [internal]
+  web:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    ports: ["80:80","443:443"]
+    environment:
+      APP_DOMAIN: ${APP_DOMAIN:?set}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./frontend:/srv/frontend:ro
+      - caddydata:/data
+      - caddyconfig:/config
+    depends_on: {api: {condition: service_healthy}}
+    networks: [internal]
+volumes:
+  pgdata: {}
+  redisdata: {}
+  miniodata: {}
+  caddydata: {}
+  caddyconfig: {}
+networks:
+  internal:
+    driver: bridge
