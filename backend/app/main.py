@@ -233,3 +233,93 @@ def add_memory(x:MemoryRequest):
  db=SessionLocal(); inf=db.get(Influencer,x.influencer_id)
  if not inf: raise HTTPException(404,'Influencer not found')
  m=inf.dna.setdefault('memory',{}); m.setdefault(x.category,[]); m[x.category].append(x.value); db.commit(); audit(db,'memory_added',inf.id,{'category':x.category}); return m
+@app.post('/api/social/connect')
+def connect_social(x:ConnectRequest):
+ if x.platform not in OAUTH: raise HTTPException(400,'Unsupported platform')
+ cid,csec,authorize,scope,token_url=OAUTH[x.platform]; client=os.getenv(cid,'')
+ if not client: return {'configuration_required':True,'platform':x.platform,'authorization_url':None,'missing_env':cid}
+ state=secrets.token_urlsafe(32); db=SessionLocal(); aid=str(uuid.uuid4()); db.add(SocialAccount(id=aid,influencer_id=x.influencer_id,platform=x.platform,handle=x.handle,metadata_json={'oauth_state':state,'redirect_uri':x.redirect_uri})); db.commit()
+ params={'client_id':client,'redirect_uri':x.redirect_uri,'response_type':'code','scope':scope,'state':state}
+ if x.platform=='youtube':params.update({'access_type':'offline','prompt':'consent'})
+ if x.platform=='tiktok':params['client_key']=client;params.pop('client_id')
+ return {'id':aid,'platform':x.platform,'authorization_url':authorize+'?'+urllib.parse.urlencode(params),'configuration_required':False}
+@app.post('/api/social/exchange')
+def exchange_token(x:TokenExchange):
+ db=SessionLocal(); a=db.get(SocialAccount,x.account_id)
+ if not a: raise HTTPException(404,'Social account not found')
+ cfg=OAUTH.get(a.platform); client=os.getenv(cfg[0],''); secret=os.getenv(cfg[1],'')
+ if not client or not secret: raise HTTPException(503,'OAuth application credentials are not configured')
+ data={'client_id':client,'client_secret':secret,'code':x.code,'redirect_uri':x.redirect_uri,'grant_type':'authorization_code'}
+ if a.platform=='tiktok': data={'client_key':client,'client_secret':secret,'code':x.code,'grant_type':'authorization_code','redirect_uri':x.redirect_uri}
+ if a.platform=='x': data={'code':x.code,'redirect_uri':x.redirect_uri,'grant_type':'authorization_code','code_verifier':os.getenv('X_CODE_VERIFIER','')}
+ auth=(client,secret) if a.platform=='x' else None
+ r=httpx.post(cfg[4],data=data,auth=auth,timeout=60)
+ if r.status_code>=400: raise HTTPException(r.status_code,r.text)
+ j=r.json(); token=j.get('access_token'); refresh=j.get('refresh_token','')
+ if not token: raise HTTPException(502,'OAuth provider did not return access_token')
+ try:
+  a.token_ciphertext=vault.encrypt(token); a.refresh_ciphertext=vault.encrypt(refresh) if refresh else ''; a.connected=True; a.expires_at=datetime.now(timezone.utc)+timedelta(seconds=int(j.get('expires_in',3600))); a.metadata_json={**(a.metadata_json or {}),'token_type':j.get('token_type','Bearer'),'scope':j.get('scope','')}; db.commit(); audit(db,'social_connected',a.id,{'platform':a.platform}); return {'connected':True,'account_id':a.id,'platform':a.platform}
+ except Exception as e: raise HTTPException(503,str(e))
+@app.get('/api/social/callback')
+def social_callback(code:str,state:str): return {'received':True,'code_received':bool(code),'state':state,'next':'POST /api/social/exchange with the matching account_id'}
+@app.patch('/api/social/account/{aid}')
+def update_social_account(aid:str,patch:dict):
+ db=SessionLocal(); a=db.get(SocialAccount,aid)
+ if not a: raise HTTPException(404,'Social account not found')
+ if 'handle' in patch:a.handle=str(patch['handle'])
+ if 'external_id' in patch:a.external_id=str(patch['external_id'])
+ if 'metadata' in patch:a.metadata_json={**(a.metadata_json or {}),**patch['metadata']}
+ db.commit(); audit(db,'social_account_updated',aid,{'keys':list(patch.keys())}); return {'id':a.id,'platform':a.platform,'external_id':a.external_id,'metadata':a.metadata_json}
+@app.get('/api/social/{iid}')
+def socials(iid):
+ db=SessionLocal(); return [{'id':a.id,'platform':a.platform,'handle':a.handle,'connected':a.connected,'external_id':a.external_id,'expires_at':a.expires_at} for a in db.query(SocialAccount).filter_by(influencer_id=iid).all()]
+@app.post('/api/content')
+def create_content(x:ContentCreate):
+ db=SessionLocal(); cid=str(uuid.uuid4()); db.add(Content(id=cid,influencer_id=x.influencer_id,title=x.title,status='DRAFT',payload=x.payload)); db.commit(); audit(db,'concept_created',cid); return {'id':cid,'status':'DRAFT'}
+@app.get('/api/content')
+def content(iid:Optional[str]=None):
+ db=SessionLocal(); q=db.query(Content); q=q.filter_by(influencer_id=iid) if iid else q; return [{'id':c.id,'influencer_id':c.influencer_id,'title':c.title,'status':c.status,'payload':c.payload} for c in q.order_by(Content.created_at.desc()).all()]
+def make_package(db,inf,x):
+ if not ai.client: raise HTTPException(503,'OPENAI_API_KEY required')
+ return ai.json(f'''You are the autonomous creative director for this AI influencer. DNA: {json.dumps(inf.dna)}. Topic: {x.topic or 'choose a relevant topic'}. Format: {x.format}. Goal: {x.goal}. Return JSON with title,hook,script,shot_list,caption,hashtags,CTA,comment_replies,dm_replies,visual_prompt,voiceover,platform_variants,production_plan. Maintain identity and brand rules.''')
+@app.post('/api/generate/content')
+def generate_content(x:GenerateRequest):
+ db=SessionLocal(); inf=db.get(Influencer,x.influencer_id)
+ if not inf: raise HTTPException(404,'Influencer not found')
+ p=make_package(db,inf,x); cid=str(uuid.uuid4()); db.add(Content(id=cid,influencer_id=inf.id,title=p.get('title','AI Content'),status='DRAFT',payload=p)); db.commit(); audit(db,'concept_generated',cid); return {'id':cid,'package':p}
+@app.patch('/api/content/{cid}/payload')
+def update_content_payload(cid,patch:dict):
+ db=SessionLocal(); c=db.get(Content,cid)
+ if not c: raise HTTPException(404,'Content not found')
+ c.payload={**c.payload,**patch}; db.commit(); audit(db,'production_payload_updated',cid,{'keys':list(patch.keys())}); return {'id':cid,'payload':c.payload}
+@app.post('/api/content/{cid}/produce')
+def produce(cid):
+ db=SessionLocal(); c=db.get(Content,cid)
+ if not c: raise HTTPException(404,'Content not found')
+ enqueue({'type':'production','content_id':cid}); c.status='PRODUCED'; db.commit(); audit(db,'production_queued',cid); return {'queued':True,'status':c.status}
+@app.post('/api/content/{cid}/qa')
+def qa(cid):
+ db=SessionLocal(); c=db.get(Content,cid)
+ if not c: raise HTTPException(404,'Content not found')
+ c.status='QA_PASSED'; db.commit(); audit(db,'qa_passed',cid); return {'status':c.status}
+@app.post('/api/content/{cid}/submit-approval')
+def submit(cid):
+ db=SessionLocal(); c=db.get(Content,cid)
+ if not c: raise HTTPException(404,'Content not found')
+ if c.status!='QA_PASSED': raise HTTPException(409,'QA must pass first')
+ c.status='WAITING_APPROVAL'; db.commit(); audit(db,'sent_for_approval',cid); return {'status':c.status}
+@app.post('/api/content/{cid}/approve')
+def approve(cid,x:ApprovalRequest):
+ db=SessionLocal(); c=db.get(Content,cid)
+ if not c or c.status!='WAITING_APPROVAL': raise HTTPException(409,'Content is not waiting for approval')
+ c.status='APPROVED'; db.commit(); audit(db,'approved',cid,{'actor':x.actor}); return {'status':c.status}
+@app.post('/api/content/{cid}/authorize')
+def authorize(cid,x:ApprovalRequest):
+ db=SessionLocal(); c=db.get(Content,cid)
+ if not c or c.status!='APPROVED': raise HTTPException(409,'Content must be approved first')
+ c.status='AUTHORIZED'; db.commit(); audit(db,'publishing_authorized',cid,{'actor':x.actor}); return {'status':c.status}
+@app.post('/api/content/{cid}/publish')
+def publish(cid):
+ db=SessionLocal(); c=db.get(Content,cid)
+ if not c or c.status!='AUTHORIZED': raise HTTPException(403,'Publishing requires human approval and explicit authorization')
+ c.status='PUBLISHING'; db.commit(); enqueue({'type':'publish','content_id':cid}); audit(db,'publish_queued',cid); return {'status':c.status}
