@@ -184,3 +184,52 @@ def checkout(x:SubscriptionCreate,claims=Depends(current_user)):
 @app.get('/api/media-kit/{iid}')
 def media_kit(iid):
  db=SessionLocal(); inf=db.get(Influencer,iid)
+ if not inf: raise HTTPException(404,'Influencer not found')
+ analytics=db.query(Analytics).join(Content,Analytics.content_id==Content.id).filter(Content.influencer_id==iid).all(); totals={}
+ for a in analytics:
+  for k,v in (a.metrics or {}).items():
+   if isinstance(v,(int,float)): totals[k]=totals.get(k,0)+v
+ return {'influencer':{'id':iid,'name':inf.name,'dna':inf.dna},'audience':inf.dna.get('audience',{}),'performance':totals,'deliverables':['Instagram Post','Instagram Reel','TikTok Video','YouTube Short','YouTube Video','UGC Package'],'rate_card':inf.dna.get('brand',{}).get('rate_card',{})}
+
+OAUTH={
+ 'instagram':('META_APP_ID','META_APP_SECRET','https://www.instagram.com/oauth/authorize','instagram_business_basic,instagram_business_content_publish,instagram_business_manage_comments,instagram_business_manage_messages','https://graph.instagram.com/oauth/access_token'),
+ 'facebook':('META_APP_ID','META_APP_SECRET','https://www.facebook.com/v24.0/dialog/oauth','pages_show_list,pages_read_engagement,pages_manage_posts','https://graph.facebook.com/v24.0/oauth/access_token'),
+ 'threads':('META_APP_ID','META_APP_SECRET','https://www.threads.net/oauth/authorize','threads_basic,threads_content_publish,threads_read_replies,threads_manage_replies,threads_manage_insights','https://graph.threads.net/oauth/access_token'),
+ 'youtube':('GOOGLE_CLIENT_ID','GOOGLE_CLIENT_SECRET','https://accounts.google.com/o/oauth2/v2/auth','https://www.googleapis.com/auth/youtube.upload https://www.googleapis.com/auth/youtube.readonly','https://oauth2.googleapis.com/token'),
+ 'tiktok':('TIKTOK_CLIENT_KEY','TIKTOK_CLIENT_SECRET','https://www.tiktok.com/v2/auth/authorize/','user.info.basic,video.publish','https://open.tiktokapis.com/v2/oauth/token/'),
+ 'linkedin':('LINKEDIN_CLIENT_ID','LINKEDIN_CLIENT_SECRET','https://www.linkedin.com/oauth/v2/authorization','openid profile w_member_social','https://www.linkedin.com/oauth/v2/accessToken'),
+ 'x':('X_CLIENT_ID','X_CLIENT_SECRET','https://twitter.com/i/oauth2/authorize','tweet.read tweet.write users.read offline.access','https://api.x.com/2/oauth2/token'),
+ 'pinterest':('PINTEREST_APP_ID','PINTEREST_APP_SECRET','https://www.pinterest.com/oauth/','boards:read,boards:write,pins:read,pins:write','https://api.pinterest.com/v5/oauth/token')}
+@app.get('/metrics')
+def metrics(): return Response(generate_latest(),media_type=CONTENT_TYPE_LATEST)
+@app.get('/health')
+def health(): return {'ok':True,'version':'6.1.0','openai_configured':bool(ai.key),'vault_configured':bool(vault.fernet),'ffmpeg_worker':True}
+@app.get('/api/capabilities')
+def capabilities(): return {'working_services':['Influencer DNA','persistent memory','OpenAI text/image/voice/transcription','S3/MinIO assets','FFmpeg media rendering','OAuth token exchange + encrypted token vault','social publishing adapters','platform analytics collectors','autonomous queue','approval + authorization gates','audit trail'],'requires_credentials':['OPENAI_API_KEY','TOKEN_VAULT_KEY','social OAuth app credentials','public S3 URL for URL-based platforms','provider credentials for non-OpenAI video generation']}
+@app.post('/api/influencers')
+def create_influencer(x:InfluencerCreate):
+ db=SessionLocal(); iid=str(uuid.uuid4()); dna={'identity':{'name':x.name,'location':x.location},'personality':x.personality,'brand':{'niche':x.niche,**x.brand},'audience':{'description':x.audience},'appearance':x.appearance,'voice':x.voice,'rules':x.rules,'memory':{'facts':[],'past_content':[],'audience_preferences':[]},'strategy':{'content_pillars':[],'cadence':{},'platforms':x.platforms}}
+ if ai.client:
+  try:
+   p=ai.json(f'Build a complete creator operating profile for {x.name}. Niche {x.niche}. Audience {x.audience}. Location {x.location}. Return JSON with content_pillars,tone,recurring_series,posting_cadence,visual_rules,do_not_do,audience_hooks,platform_strategy.')
+   dna['strategy'].update({k:p[k] for k in ('content_pillars','tone','recurring_series','posting_cadence','platform_strategy') if k in p}); dna['brand']['visual_rules']=p.get('visual_rules',[]); dna['rules']['do_not_do']=p.get('do_not_do',[]); dna['audience']['hooks']=p.get('audience_hooks',[])
+  except Exception: pass
+ db.add(Influencer(id=iid,name=x.name,dna=dna)); db.commit(); audit(db,'influencer_created',iid); return {'id':iid,'dna':dna}
+@app.get('/api/influencers')
+def list_influencers():
+ db=SessionLocal(); return [{'id':x.id,'name':x.name,'status':x.status} for x in db.query(Influencer).all()]
+@app.get('/api/influencers/{iid}')
+def get_influencer(iid):
+ db=SessionLocal(); x=db.get(Influencer,iid)
+ if not x: raise HTTPException(404,'Influencer not found')
+ return {'id':x.id,'name':x.name,'dna':x.dna,'status':x.status}
+@app.patch('/api/influencers/{iid}/dna')
+def update_dna(iid,patch:dict):
+ db=SessionLocal(); x=db.get(Influencer,iid)
+ if not x: raise HTTPException(404,'Influencer not found')
+ x.dna={**x.dna,**patch}; db.commit(); audit(db,'dna_updated',iid,patch); return x.dna
+@app.post('/api/memory')
+def add_memory(x:MemoryRequest):
+ db=SessionLocal(); inf=db.get(Influencer,x.influencer_id)
+ if not inf: raise HTTPException(404,'Influencer not found')
+ m=inf.dna.setdefault('memory',{}); m.setdefault(x.category,[]); m[x.category].append(x.value); db.commit(); audit(db,'memory_added',inf.id,{'category':x.category}); return m
