@@ -1,0 +1,53 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>TrendFlow AI</title>
+<style>
+:root{font-family:Inter,system-ui,sans-serif;background:#0b0b10;color:#f6f6f7}body{margin:0}header{padding:18px 24px;border-bottom:1px solid #272733;display:flex;justify-content:space-between;align-items:center}main{max-width:1100px;margin:auto;padding:28px}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:16px}.card{background:#14141c;border:1px solid #292936;border-radius:16px;padding:20px;margin-bottom:16px}button{border:0;border-radius:10px;padding:11px 16px;background:#fff;color:#111;font-weight:700;cursor:pointer}input,textarea,select{width:100%;box-sizing:border-box;background:#0f0f15;color:#fff;border:1px solid #343442;border-radius:10px;padding:11px;margin:6px 0 12px}.row{display:grid;grid-template-columns:1fr 1fr;gap:14px}.muted{color:#9a9aa8}.status{color:#7ee787}.error{color:#ff7b72}.hidden{display:none}pre{white-space:pre-wrap;overflow:auto}
+</style></head>
+<body>
+<header><b>🤖 TrendFlow AI</b><span id="connection" class="muted">Checking API…</span></header>
+<main>
+<section id="login" class="card">
+<h1>AI Influencer Operating System</h1><p class="muted">Create and operate an AI influencer from one workspace.</p>
+<div class="row"><div><label>Email</label><input id="email" type="email" placeholder="you@example.com"></div><div><label>Password</label><input id="password" type="password" placeholder="12+ characters"></div></div>
+<div class="row"><button onclick="login()">Login</button><button onclick="register()">Create account</button></div><p id="authmsg"></p>
+</section>
+<section id="app" class="hidden">
+<div class="grid">
+<div class="card"><div class="muted">Influencers</div><h2 id="infCount">0</h2></div>
+<div class="card"><div class="muted">Content</div><h2 id="contentCount">0</h2></div>
+<div class="card"><div class="muted">Autonomous Mode</div><h2 class="status">READY</h2></div>
+</div>
+<div class="card">
+<h2>Create AI Influencer</h2>
+<div class="row"><div><label>Name</label><input id="name" placeholder="Nyra Luxe"></div><div><label>Niche</label><input id="niche" placeholder="Luxury fashion & travel"></div></div>
+<div class="row"><div><label>Location</label><input id="location" placeholder="Dubai"></div><div><label>Audience</label><input id="audience" placeholder="Luxury lifestyle audience"></div></div>
+<button onclick="createInfluencer()">Create Influencer</button>
+</div>
+<div class="card"><h2>Influencers</h2><div id="influencers"></div></div>
+<div class="card">
+<h2>AI Content Studio</h2>
+<div class="row"><div><label>Topic</label><input id="topic" placeholder="Luxury hotel morning routine"></div><div><label>Format</label><select id="format"><option value="reel">Reel</option><option value="post">Post</option><option value="short">Short</option></select></div></div>
+<button onclick="generate()">Generate Content</button>
+<pre id="result"></pre>
+</div>
+</section>
+</main>
+<script>
+const API='';
+let token=localStorage.getItem('tf_token')||'',active=null;
+const $=id=>document.getElementById(id);
+async function api(path,opt={}){opt.headers={...(opt.headers||{}),...(token?{Authorization:'Bearer '+token}:{})};if(opt.body&&typeof opt.body!=='string'){opt.headers['Content-Type']='application/json';opt.body=JSON.stringify(opt.body)}let r;try{r=await fetch(API+path,opt)}catch(e){throw Error('TrendFlow API is not reachable. Open the application through its URL, not as a local HTML file.')}let text=await r.text(),data={};try{data=text?JSON.parse(text):{}}catch{}if(!r.ok)throw Error(data.detail||'Request failed ('+r.status+')');return data}
+async function check(){try{let x=await fetch('/health/live');if(x.ok){$('connection').textContent='● API connected';$('connection').className='status'}else throw 0}catch{$('connection').textContent='● API unavailable';$('connection').className='error'}}
+async function login(){try{let x=await api('/api/auth/login',{method:'POST',body:{email:$('email').value,password:$('password').value}});token=x.access_token;localStorage.setItem('tf_token',token);await start()}catch(e){$('authmsg').textContent=e.message;$('authmsg').className='error'}}
+async function register(){try{let x=await api('/api/auth/register',{method:'POST',body:{email:$('email').value,password:$('password').value,name:$('name').value||'TrendFlow Owner'}});token=x.access_token;localStorage.setItem('tf_token',token);await start()}catch(e){$('authmsg').textContent=e.message;$('authmsg').className='error'}}
+async function start(){try{await load()}catch(e){localStorage.removeItem('tf_token');token='';$('authmsg').textContent=e.message;$('authmsg').className='error';return}$('login').classList.add('hidden');$('app').classList.remove('hidden')}
+async function load(){let x=await api('/api/influencers');$('infCount').textContent=x.length;let c=await api('/api/content');$('contentCount').textContent=c.length;$('influencers').innerHTML=x.map(i=>'<div class="card"><b>'+esc(i.name)+'</b><div class="muted">'+esc(i.status)+'</div><button onclick="runAuto(\''+i.id+'\')">Run autonomous cycle</button></div>').join('')||'<p class="muted">Create your first influencer above.</p>';active=x[0]||null}
+async function createInfluencer(){try{let x=await api('/api/influencers',{method:'POST',body:{name:$('name').value,niche:$('niche').value,location:$('location').value,audience:$('audience').value,platforms:['instagram','tiktok','youtube']}});active={id:x.id};await load()}catch(e){alert(e.message)}}
+async function generate(){if(!active)return alert('Create an influencer first');try{let x=await api('/api/generate/content',{method:'POST',body:{influencer_id:active.id,topic:$('topic').value,format:$('format').value,goal:'engagement',include_image:true,include_voice:true}});$('result').textContent=JSON.stringify(x.package,null,2);await load()}catch(e){$('result').textContent=e.message}}
+async function runAuto(id){try{let x=await api('/api/autonomy/run?iid='+encodeURIComponent(id),{method:'POST'});$('result').textContent=JSON.stringify(x,null,2);await load()}catch(e){alert(e.message)}}
+function esc(s){return String(s||'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]))}
+check();if(token)start();
+</script></body></html>
