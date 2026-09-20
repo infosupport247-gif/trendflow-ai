@@ -84,3 +84,103 @@ async def metrics_middleware(request:Request,call_next):
  started=time.perf_counter(); response=await call_next(request); path=request.url.path
  REQUESTS.labels(request.method,path,str(response.status_code)).inc(); LATENCY.labels(request.method,path).observe(time.perf_counter()-started)
  response.headers['X-Request-ID']=request.headers.get('X-Request-ID',str(uuid.uuid4())); return response
+async def auth_boundary(request:Request, call_next):
+    path=request.url.path
+    public = path.startswith('/health') or path in {'/api/auth/register','/api/auth/login','/api/social/callback'} or not path.startswith('/api/')
+    if not public:
+        auth=request.headers.get('Authorization','')
+        if not auth.startswith('Bearer '):
+            service=request.headers.get('X-Service-Token','')
+            if not INTERNAL_SERVICE_TOKEN or service != INTERNAL_SERVICE_TOKEN:
+                return __import__('fastapi').responses.JSONResponse({'detail':'Authentication required'},status_code=401)
+    return await call_next(request)
+
+@app.middleware('http')
+async def security_middleware(request:Request, call_next):
+    rid=request.headers.get('X-Request-ID') or str(uuid.uuid4())
+    response=await call_next(request)
+    response.headers['X-Request-ID']=rid
+    response.headers['X-Content-Type-Options']='nosniff'
+    response.headers['X-Frame-Options']='DENY'
+    response.headers['Referrer-Policy']='strict-origin-when-cross-origin'
+    response.headers['Permissions-Policy']='camera=(), microphone=(), geolocation=()'
+    if ENV == 'production': response.headers['Strict-Transport-Security']='max-age=31536000; includeSubDomains'
+    return response
+
+@app.get('/health/live')
+def health_live(): return {'status':'ok'}
+
+@app.get('/health/ready')
+def health_ready():
+    checks={}
+    try:
+        db=SessionLocal(); db.execute(__import__('sqlalchemy').text('SELECT 1')); checks['database']='ok'
+    except Exception as e: checks['database']=f'error:{type(e).__name__}'
+    try: rds.ping(); checks['redis']='ok'
+    except Exception as e: checks['redis']=f'error:{type(e).__name__}'
+    ok=all(v=='ok' for v in checks.values())
+    return {'status':'ready' if ok else 'not_ready','checks':checks}
+
+def issue_token(user):
+ return jwt.encode({'sub':user.id,'email':user.email,'role':user.role,'exp':datetime.now(timezone.utc)+timedelta(days=7)},JWT_SECRET,algorithm='HS256')
+def current_user(authorization:Optional[str]=Header(None)):
+ if not authorization or not authorization.startswith('Bearer '): raise HTTPException(401,'Authentication required')
+ try: return jwt.decode(authorization[7:],JWT_SECRET,algorithms=['HS256'])
+ except Exception: raise HTTPException(401,'Invalid or expired token')
+
+@app.post('/api/auth/register')
+def register(x:AuthRegister):
+ if len(x.password) < 12: raise HTTPException(400,'Password must be at least 12 characters')
+ db=SessionLocal()
+ if db.query(User).filter_by(email=x.email.lower()).first(): raise HTTPException(409,'Email already registered')
+ u=User(id=str(uuid.uuid4()),email=x.email.lower(),password_hash=pwd.hash(x.password),name=x.name); db.add(u); db.flush()
+ w=Workspace(id=str(uuid.uuid4()),owner_id=u.id,name=f"{x.name or x.email.split('@')[0]}'s Workspace",plan='creator'); db.add(w); db.add(WorkspaceMember(id=str(uuid.uuid4()),workspace_id=w.id,user_id=u.id,role='owner')); db.add(Subscription(id=str(uuid.uuid4()),user_id=u.id,plan='creator')); db.commit()
+ return {'access_token':issue_token(u),'user':{'id':u.id,'email':u.email,'name':u.name},'workspace':{'id':w.id,'name':w.name,'plan':w.plan}}
+@app.post('/api/auth/login')
+def login(x:AuthLogin):
+ db=SessionLocal(); u=db.query(User).filter_by(email=x.email.lower()).first()
+ if not u or not pwd.verify(x.password,u.password_hash): raise HTTPException(401,'Invalid credentials')
+ return {'access_token':issue_token(u),'user':{'id':u.id,'email':u.email,'name':u.name,'role':u.role}}
+@app.get('/api/auth/me')
+def me(claims=Depends(current_user)):
+ db=SessionLocal(); u=db.get(User,claims['sub']); return {'id':u.id,'email':u.email,'name':u.name,'role':u.role}
+@app.get('/api/workspaces')
+def workspaces(claims=Depends(current_user)):
+ db=SessionLocal(); return [{'id':w.id,'name':w.name,'plan':w.plan,'role':db.query(WorkspaceMember).filter_by(workspace_id=w.id,user_id=claims['sub']).first().role} for w in db.query(Workspace).join(WorkspaceMember,Workspace.id==WorkspaceMember.workspace_id).filter(WorkspaceMember.user_id==claims['sub']).all()]
+@app.post('/api/workspaces')
+def create_workspace(x:WorkspaceCreate,claims=Depends(current_user)):
+ db=SessionLocal(); w=Workspace(id=str(uuid.uuid4()),owner_id=claims['sub'],name=x.name,plan=x.plan); db.add(w); db.add(WorkspaceMember(id=str(uuid.uuid4()),workspace_id=w.id,user_id=claims['sub'],role='owner')); db.commit(); return {'id':w.id,'name':w.name,'plan':w.plan}
+@app.get('/api/calendar/{iid}')
+def calendar(iid):
+ db=SessionLocal(); return [{'id':x.id,'content_id':x.content_id,'platform':x.platform,'scheduled_at':x.scheduled_at,'status':x.status,'notes':x.notes} for x in db.query(CalendarItem).filter_by(influencer_id=iid).order_by(CalendarItem.scheduled_at).all()]
+@app.post('/api/calendar')
+def add_calendar(x:CalendarCreate):
+ db=SessionLocal(); item=CalendarItem(id=str(uuid.uuid4()),**x.model_dump()); db.add(item); db.commit(); audit(db,'calendar_scheduled',item.id,x.model_dump()); return {'id':item.id,'status':item.status}
+@app.delete('/api/calendar/{cid}')
+def delete_calendar(cid):
+ db=SessionLocal(); x=db.get(CalendarItem,cid)
+ if not x: raise HTTPException(404,'Calendar item not found')
+ db.delete(x); db.commit(); return {'deleted':True}
+@app.get('/api/brand-deals/{iid}')
+def brand_deals(iid):
+ db=SessionLocal(); return [{'id':x.id,'brand':x.brand,'contact':x.contact,'stage':x.stage,'value':x.value,'brief':x.brief} for x in db.query(BrandDeal).filter_by(influencer_id=iid).order_by(BrandDeal.created_at.desc()).all()]
+@app.post('/api/brand-deals')
+def add_brand_deal(x:BrandDealCreate):
+ db=SessionLocal(); d=BrandDeal(id=str(uuid.uuid4()),**x.model_dump()); db.add(d); db.commit(); audit(db,'brand_deal_created',d.id,x.model_dump()); return {'id':d.id,'stage':d.stage}
+@app.patch('/api/brand-deals/{did}')
+def update_brand_deal(did,patch:dict):
+ db=SessionLocal(); d=db.get(BrandDeal,did)
+ if not d: raise HTTPException(404,'Brand deal not found')
+ for k in ('brand','contact','stage','value','brief'):
+  if k in patch: setattr(d,k,patch[k])
+ db.commit(); return {'id':d.id,'stage':d.stage,'value':d.value}
+@app.get('/api/subscription')
+def subscription(claims=Depends(current_user)):
+ db=SessionLocal(); s=db.query(Subscription).filter_by(user_id=claims['sub']).first(); return {'plan':s.plan,'status':s.status,'stripe_configured':bool(os.getenv('STRIPE_SECRET_KEY'))}
+@app.post('/api/subscription/checkout')
+def checkout(x:SubscriptionCreate,claims=Depends(current_user)):
+ if not os.getenv('STRIPE_SECRET_KEY'): return {'mode':'configuration_required','plan':x.plan,'message':'Set STRIPE_SECRET_KEY and PRICE_* variables to enable live checkout.'}
+ return {'mode':'stripe_adapter_ready','plan':x.plan,'message':'Stripe checkout adapter boundary is ready; configure price IDs and webhook endpoint.'}
+@app.get('/api/media-kit/{iid}')
+def media_kit(iid):
+ db=SessionLocal(); inf=db.get(Influencer,iid)
