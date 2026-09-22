@@ -1,0 +1,24 @@
+{
+  "name": "TrendFlow AI",
+  "image": "mcr.microsoft.com/devcontainers/base:ubuntu",
+  "features": {
+    "ghcr.io/devcontainers/features/docker-in-docker:2": {}
+  },
+  "forwardPorts": [8080],
+  "portsAttributes": {
+    "8080": {
+      "label": "TrendFlow AI",
+      "onAutoForward": "openBrowser"
+    }
+  },
+  "postCreateCommand": "docker compose up -d --build",
+  "postStartCommand": "docker compose up -d",
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "ms-azuretools.vscode-docker",
+        "ms-python.python"
+      ]
+    }
+  }
+}
